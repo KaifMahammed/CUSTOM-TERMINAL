@@ -127,7 +127,6 @@ The terminal supports the following editing and navigation shortcuts:
 - The script interpreter supports a subset of shell syntax and is not a complete Bash implementation.
 - `multiWatch` launches watched command strings through `/bin/sh -c`; this is separate from the custom script interpreter.
 - An X11 display must be available for the graphical application to start.
-- The current build may emit a GCC `-Wformat-truncation` warning in `complete_filename()` when formatting a numbered completion choice. The warning does not necessarily prevent compilation.
 - The current build may emit GCC warnings related to ignored `chdir()` return values and possible filename-completion output truncation. These warnings do not prevent compilation.
 
 - Shared-memory initialization may fall back to process-local history and clipboard state if POSIX shared memory cannot be initialized.
