@@ -70,6 +70,11 @@ typedef struct {
 } WatchState;
 
 static Display *display; static Window window; static GC gc; static int screen;
+static Pixmap back_buffer;
+static int back_buffer_width = 0;
+static int back_buffer_height = 0;
+static int current_win_width = WIN_WIDTH;
+static int current_win_height = WIN_HEIGHT;
 static Atom wm_delete; static TerminalTab tabs[MAX_TABS];
 static int tab_count = 1, active_tab = 0; static const char *title = "Terminator - A Custom Terminal";
 static Job jobs[MAX_JOBS]; static int next_job_id = 1;
@@ -91,9 +96,14 @@ static int worker_shutdown = 0;
 /* Stage 3: process-backed command workers. The X11 parent owns the UI and tab metadata. */
 static int process_mode = 0;
 #define PROCESS_COMMAND_MAGIC 0x5445524dU
-typedef struct { uint32_t magic; char cwd[PATH_MAX]; char command[COMMAND_SIZE]; } ProcessCommand;
+typedef struct {
+    uint32_t magic;
+    int background;
+    char cwd[PATH_MAX];
+    char command[COMMAND_SIZE];
+} ProcessCommand;
 static int start_process_worker(TerminalTab *t);
-static int dispatch_process_command(TerminalTab *t, const char *cwd, const char *command);
+static int dispatch_process_command(TerminalTab *t, const char *cwd,const char *command, int background);
 static void *tab_worker_main(void *arg);
 static int enqueue_tab_command(int tab_index, const char *command);
 static void start_tab_workers(void);
@@ -181,6 +191,35 @@ static int selection_end_line = 0, selection_end_col = 0;
 
 static TerminalTab *current_tab(void) { return &tabs[active_tab]; }
 static void on_sigchld(int sig) { (void)sig; got_sigchld = 1; }
+static void ensure_back_buffer(void) {
+    int width = current_win_width;
+    int height = current_win_height;
+
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+
+    if (back_buffer &&
+        back_buffer_width == width &&
+        back_buffer_height == height) {
+        return;
+    }
+
+    if (back_buffer)
+        XFreePixmap(display, back_buffer);
+
+    back_buffer = XCreatePixmap(
+        display,
+        window,
+        (unsigned int)width,
+        (unsigned int)height,
+        (unsigned int)DefaultDepth(display, screen)
+    );
+
+    back_buffer_width = width;
+    back_buffer_height = height;
+}
+
+
 
 static void add_line(TerminalTab *tab, const char *text) {
     char copy[LINE_SIZE];
@@ -194,13 +233,31 @@ static void add_line(TerminalTab *tab, const char *text) {
 }
 static void add_output(TerminalTab *tab, const char *text) {
     for (size_t i = 0; text[i]; i++) {
-        char ch = text[i]; if (ch == '\r') continue;
+        char ch = text[i];
+        if (ch == '\r') continue;
+
         if (ch == '\n') {
-            tab->output_pending[tab->pending_len] = '\0'; add_line(tab, tab->output_pending);
-            tab->pending_len = 0; tab->output_pending[0] = '\0'; continue;
+            tab->output_pending[tab->pending_len] = '\0';
+
+            if (strncmp(tab->output_pending, "\x1eTERM_STATUS:", 13) == 0) {
+                tab->last_status = atoi(tab->output_pending + 13);
+            } else {
+                add_line(tab, tab->output_pending);
+            }
+
+            tab->pending_len = 0;
+            tab->output_pending[0] = '\0';
+            continue;
         }
-        if (tab->pending_len < LINE_SIZE - 1) tab->output_pending[tab->pending_len++] = ch;
-        else { tab->output_pending[tab->pending_len] = '\0'; add_line(tab, tab->output_pending); tab->pending_len = 0; tab->output_pending[tab->pending_len++] = ch; }
+
+        if (tab->pending_len < LINE_SIZE - 1) {
+            tab->output_pending[tab->pending_len++] = ch;
+        } else {
+            tab->output_pending[tab->pending_len] = '\0';
+            add_line(tab, tab->output_pending);
+            tab->pending_len = 0;
+            tab->output_pending[tab->pending_len++] = ch;
+        }
     }
 }
 static void finish_pending_output(TerminalTab *tab) {
@@ -231,13 +288,13 @@ static void initialize_tab(int i, const char *cwd) {
     if (cwd) snprintf(t->cwd, sizeof(t->cwd), "%s", cwd);
     else if (!getcwd(t->cwd, sizeof(t->cwd))) snprintf(t->cwd, sizeof(t->cwd), "/");
     t->process_cmd_fd = -1; t->process_worker_pid = -1;
-    add_line(t, "Welcome to Terminator."); add_line(t, "Task 1: X11 GUI, tabs and output handling.");
-    add_line(t, "Task 2: built-ins, external commands and basic job control.");
+    add_line(t, "Welcome to Terminator."); 
+    
     if (process_mode) {
-        add_line(t, "Act 4 Stage 4: process mode with shared-memory history/clipboard.");
-        if (start_process_worker(t) < 0) add_line(t, "Stage 3: failed to start this tab's process worker.");
+        add_line(t, "Opened in Process Mode");
+        if (start_process_worker(t) < 0) add_line(t, "failed to start this tab's process worker.");
     } else {
-        add_line(t, "Act 4 Stage 2: per-tab command worker threads enabled.");
+        add_line(t, "Opened in Thread Mode");
     }
 }
 static void open_new_tab(void)
@@ -298,7 +355,10 @@ static void close_current_tab(void) {
         pthread_mutex_unlock(&command_execution_mutex);
     }
 }
-static void draw_text(int x, int y, const char *s) { XDrawString(display, window, gc, x, y, s, (int)strlen(s)); }
+static void draw_text(int x, int y, const char *s) {
+    XDrawString(display, back_buffer, gc, x, y,
+                s, (int)strlen(s));
+}
 /* Measure text with the actual X11 font used by the GC. Do not assume that
    every character is exactly eight pixels wide when positioning the cursor. */
 static int text_width(const char *s, size_t len) {
@@ -332,42 +392,194 @@ static void draw_buffer_line(TerminalTab *t, int line_index, int y) {
     memcpy(part, line, (size_t)prefix); part[prefix] = '\0'; draw_text(12, y, part);
     int selected_len = b - a; if (selected_len >= LINE_SIZE) selected_len = LINE_SIZE - 1;
     int sx = 12 + a * 8; XSetForeground(display, gc, BlackPixel(display, screen));
-    XFillRectangle(display, window, gc, sx, y - 13, (unsigned int)(selected_len * 8), 16);
+    XFillRectangle(display, back_buffer, gc, sx, y - 13, (unsigned int)(selected_len * 8), 16);
     memcpy(part, line + a, (size_t)selected_len); part[selected_len] = '\0';
     XSetForeground(display, gc, WhitePixel(display, screen)); draw_text(sx, y, part);
     XSetForeground(display, gc, BlackPixel(display, screen)); draw_text(12 + b * 8, y, line + b);
 }
 static void draw_tabs(void) {
-    XSetForeground(display, gc, WhitePixel(display, screen)); XFillRectangle(display, window, gc, 0, 0, WIN_WIDTH, TAB_HEIGHT);
+    XSetForeground(display, gc, WhitePixel(display, screen)); XFillRectangle(display, back_buffer, gc, 0, 0, WIN_WIDTH, TAB_HEIGHT);
     for (int i = 0; i < tab_count; i++) {
         char label[128]; snprintf(label, sizeof(label), "%d: %.17s", i + 1, tabs[i].cwd);
         XSetForeground(display, gc, i == active_tab ? BlackPixel(display, screen) : 0x777777);
-        XDrawRectangle(display, window, gc, 5 + i * 170, 4, 160, 27); draw_text(10 + i * 170, 22, label);
+        XDrawRectangle(display, back_buffer, gc, 5 + i * 170, 4, 160, 27); draw_text(10 + i * 170, 22, label);
     }
     XSetForeground(display, gc, BlackPixel(display, screen)); draw_text(10 + tab_count * 170, 22, "[ + ]");
 }
 static void draw_screen(void) {
-    TerminalTab *t = current_tab(); XClearWindow(display, window); draw_tabs();
-    XSetForeground(display, gc, BlackPixel(display, screen)); draw_text(12, TAB_HEIGHT + 23, "Terminator - A Custom Terminal");
-    int visible = (WIN_HEIGHT - TAB_HEIGHT - 70) / LINE_HEIGHT;
-    int start = t->line_count - visible; if (start < 0) start = 0; start -= t->scroll_offset; if (start < 0) start = 0;
-    int end = start + visible; if (end > t->line_count) end = t->line_count;
-    int y = TAB_HEIGHT + 48; for (int i = start; i < end; i++, y += LINE_HEIGHT) draw_buffer_line(t, i, y);
-    XDrawLine(display, window, gc, 5, WIN_HEIGHT - 43, WIN_WIDTH - 5, WIN_HEIGHT - 43);
-    char prompt[PATH_MAX + 64];
-    if (history_search_mode) snprintf(prompt, sizeof(prompt), "Enter search term: ");
-    else if (t->continuation_active) snprintf(prompt, sizeof(prompt), "> ");
-    else snprintf(prompt, sizeof(prompt), "%s > ", t->cwd);
-    draw_text(12, WIN_HEIGHT - 17, prompt);
-    int input_x = 12 + text_width(prompt, strlen(prompt));
-    draw_text(input_x, WIN_HEIGHT - 17, t->input);
-    /* Clamp defensively so a stale cursor can never index beyond the buffer. */
-    if (t->input_cursor > t->input_len) t->input_cursor = t->input_len;
-    int cursor_x = input_x + text_width(t->input, t->input_cursor);
-    XDrawLine(display, window, gc, cursor_x, WIN_HEIGHT - 29, cursor_x, WIN_HEIGHT - 14);
-    XFlush(display);
-}
+    TerminalTab *t = current_tab();
 
+    int win_w = current_win_width;
+    int win_h = current_win_height;
+
+    if (win_w < 200) win_w = 200;
+    if (win_h < 200) win_h = 200;
+
+   ensure_back_buffer();
+
+XSetForeground(display, gc, WhitePixel(display, screen));
+
+XFillRectangle(display, back_buffer, gc,
+               0, 0,
+               (unsigned int)current_win_width,
+               (unsigned int)current_win_height);
+
+draw_tabs();
+
+    XSetForeground(display, gc, BlackPixel(display, screen));
+
+    draw_text(12, TAB_HEIGHT + 23,
+              "Terminator - A Custom Terminal");
+
+    char prompt[PATH_MAX + 64];
+
+    if (history_search_mode)
+        snprintf(prompt, sizeof(prompt), "Enter search term: ");
+    else if (t->continuation_active)
+        snprintf(prompt, sizeof(prompt), "> ");
+    else
+        snprintf(prompt, sizeof(prompt), "%s > ", t->cwd);
+
+    if (t->input_cursor > t->input_len)
+        t->input_cursor = t->input_len;
+
+    int prompt_width = text_width(prompt, strlen(prompt));
+    int input_start_x = 12 + prompt_width;
+
+    /* Calculate the visual position of every input character. */
+    int pos_x[INPUT_SIZE];
+    int pos_line[INPUT_SIZE];
+
+    int line = 0;
+    int x = input_start_x;
+
+    pos_x[0] = x;
+    pos_line[0] = 0;
+
+    for (size_t i = 0; i < t->input_len; i++) {
+        char ch[2] = { t->input[i], '\0' };
+        int cw = text_width(ch, 1);
+
+        if (x + cw > win_w - 15) {
+            line++;
+            x = 12;
+        }
+
+        x += cw;
+
+        pos_x[i + 1] = x;
+        pos_line[i + 1] = line;
+    }
+
+    int total_input_lines = line + 1;
+
+    /* Determine how many input lines fit in the window. */
+    int max_visible_lines =
+        (win_h - TAB_HEIGHT - 65) / LINE_HEIGHT;
+
+    if (max_visible_lines < 1)
+        max_visible_lines = 1;
+
+    int visible_input_lines = total_input_lines;
+
+    if (visible_input_lines > max_visible_lines)
+        visible_input_lines = max_visible_lines;
+
+    /* Keep the cursor visible. */
+    int cursor_line = pos_line[t->input_cursor];
+
+    int first_visible_line = 0;
+
+    if (cursor_line >= visible_input_lines)
+        first_visible_line =
+            cursor_line - visible_input_lines + 1;
+
+    if (first_visible_line + visible_input_lines >
+        total_input_lines) {
+        first_visible_line =
+            total_input_lines - visible_input_lines;
+    }
+
+    int input_bottom = win_h - 17;
+
+    int input_first_y =
+        input_bottom - (visible_input_lines - 1) * LINE_HEIGHT;
+
+    /* Draw output in the space above the input. */
+    int output_top = TAB_HEIGHT + 48;
+    int separator_y = input_first_y - 18;
+
+    XDrawLine(display, back_buffer, gc,
+              5, separator_y,
+              win_w - 5, separator_y);
+
+    int output_visible =
+        (separator_y - output_top) / LINE_HEIGHT;
+
+    if (output_visible < 0)
+        output_visible = 0;
+
+    int start = t->line_count - output_visible;
+
+    if (start < 0)
+        start = 0;
+
+    start -= t->scroll_offset;
+
+    if (start < 0)
+        start = 0;
+
+    int end = start + output_visible;
+
+    if (end > t->line_count)
+        end = t->line_count;
+
+    int y = output_top;
+
+    for (int i = start; i < end; i++, y += LINE_HEIGHT)
+        draw_buffer_line(t, i, y);
+
+    /* Draw the prompt if its first line is visible. */
+    if (first_visible_line == 0) {
+        draw_text(12, input_first_y, prompt);
+    }
+
+    /* Draw the visible portion of the input. */
+    for (size_t i = 0; i < t->input_len; i++) {
+        int current_line = pos_line[i];
+
+        if (current_line < first_visible_line ||
+            current_line >= first_visible_line + visible_input_lines)
+            continue;
+
+        char ch[2] = { t->input[i], '\0' };
+
+        int draw_x = pos_x[i];
+
+        int draw_y = input_first_y +
+            (current_line - first_visible_line) * LINE_HEIGHT;
+
+        draw_text(draw_x, draw_y, ch);
+    }
+
+    /* Draw cursor at its actual visual position. */
+    int cursor_x = pos_x[t->input_cursor];
+
+    int cursor_y = input_first_y +
+        (cursor_line - first_visible_line) * LINE_HEIGHT;
+
+    XDrawLine(display, back_buffer, gc,
+              cursor_x, cursor_y - 13,
+              cursor_x, cursor_y + 2);
+
+    XCopyArea(display, back_buffer, window, gc,
+          0, 0,
+          (unsigned int)win_w,
+          (unsigned int)win_h,
+          0, 0);
+
+XFlush(display);
+}
 static int shared_state_init(void) {
     char name[96];
     snprintf(name, sizeof(name), "/terminator_act4_%lu", (unsigned long)getuid());
@@ -1311,23 +1523,199 @@ static int start_process_worker(TerminalTab *t)
         struct sigaction sa; memset(&sa, 0, sizeof(sa)); sa.sa_handler = process_worker_signal; sigemptyset(&sa.sa_mask);
         (void)sigaction(SIGINT, &sa, NULL); (void)sigaction(SIGTERM, &sa, NULL); (void)sigaction(SIGTSTP, &sa, NULL);
         for (;;) {
-            ProcessCommand msg;
-            int rr = read_full_fd(cmdpipe[0], &msg, sizeof(msg));
-            if (rr <= 0) break;
-            if (msg.magic != PROCESS_COMMAND_MAGIC) continue;
-            pid_t cpid = fork();
-            if (cpid < 0) { dprintf(STDERR_FILENO, "terminator: process worker fork failed: %s\n", strerror(errno)); continue; }
-            if (cpid == 0) {
-                (void)setpgid(0, 0);
-                if (chdir(msg.cwd) < 0) { dprintf(STDERR_FILENO, "chdir: %s\n", strerror(errno)); _exit(126); }
-                execl("/bin/sh", "sh", "-c", msg.command, (char *)NULL);
-                dprintf(STDERR_FILENO, "terminator: cannot execute shell: %s\n", strerror(errno)); _exit(127);
+    ProcessCommand msg;
+    int rr = read_full_fd(cmdpipe[0], &msg, sizeof(msg));
+    if (rr <= 0) break;
+        if (msg.magic != PROCESS_COMMAND_MAGIC) continue;
+
+    /* Handle job-control built-ins inside the process worker. */
+    reap_jobs(NULL);
+
+    char job_command[COMMAND_SIZE];
+    snprintf(job_command, sizeof(job_command), "%s", msg.command);
+
+    char *job_saveptr = NULL;
+    char *job_name = strtok_r(job_command, " \t\r\n", &job_saveptr);
+
+    if (job_name && strcmp(job_name, "jobs") == 0) {
+        int found = 0;
+
+        for (int i = 0; i < MAX_JOBS; ++i) {
+            if (jobs[i].used) {
+                dprintf(STDOUT_FILENO, "[%d] %s %s\n",
+                        jobs[i].id,
+                        jobs[i].stopped ? "Stopped" : "Running",
+                        jobs[i].command);
+                found = 1;
             }
-            (void)setpgid(cpid, cpid); process_worker_pgid = (sig_atomic_t)cpid;
-            int st = 0;
-            while (waitpid(cpid, &st, 0) < 0 && errno == EINTR) {}
-            process_worker_pgid = -1;
         }
+
+        if (!found)
+            dprintf(STDOUT_FILENO, "No jobs\n");
+
+        continue;
+    }
+        if (job_name && strcmp(job_name, "bg") == 0) {
+        char *arg = strtok_r(NULL, " \t\r\n", &job_saveptr);
+
+        if (!arg) {
+            dprintf(STDERR_FILENO, "bg: usage: bg %%job\n");
+            continue;
+        }
+
+        if (*arg == '%') arg++;
+
+        char *end = NULL;
+        long id = strtol(arg, &end, 10);
+
+        if (!end || *end != '\0' || id <= 0 || id > INT_MAX) {
+            dprintf(STDERR_FILENO, "bg: invalid job ID\n");
+            continue;
+        }
+
+        Job *job = find_job((int)id);
+
+        if (!job) {
+            dprintf(STDERR_FILENO, "bg: no such job\n");
+            continue;
+        }
+
+        if (kill(-job->pgid, SIGCONT) < 0) {
+            dprintf(STDERR_FILENO, "bg: could not continue job\n");
+            continue;
+        }
+
+        job->running = 1;
+        job->stopped = 0;
+        job->background = 1;
+
+        dprintf(STDOUT_FILENO, "[%d]+ %s &\n",
+                job->id, job->command);
+        continue;
+    }
+
+        if (job_name && strcmp(job_name, "fg") == 0) {
+        char *arg = strtok_r(NULL, " \t\r\n", &job_saveptr);
+
+        if (!arg) {
+            dprintf(STDERR_FILENO, "fg: usage: fg %%job\n");
+            continue;
+        }
+
+        if (*arg == '%') arg++;
+
+        char *end = NULL;
+        long id = strtol(arg, &end, 10);
+
+        if (!end || *end != '\0' || id <= 0 || id > INT_MAX) {
+            dprintf(STDERR_FILENO, "fg: invalid job ID\n");
+            continue;
+        }
+
+        Job *job = find_job((int)id);
+
+        if (!job) {
+            dprintf(STDERR_FILENO, "fg: no such job\n");
+            continue;
+        }
+
+        job->background = 0;
+        job->running = 1;
+        job->stopped = 0;
+
+        if (kill(-job->pgid, SIGCONT) < 0) {
+            dprintf(STDERR_FILENO, "fg: could not continue job\n");
+            continue;
+        }
+
+        process_worker_pgid = (sig_atomic_t)job->pgid;
+
+        int status = 0;
+        pid_t result;
+
+        do {
+            result = waitpid(-job->pgid, &status, WUNTRACED);
+        } while (result < 0 && errno == EINTR);
+
+        process_worker_pgid = -1;
+
+        if (result > 0 && WIFSTOPPED(status)) {
+            job->stopped = 1;
+            job->running = 0;
+            job->background = 1;
+            dprintf(STDOUT_FILENO, "[%d]+ Stopped %s\n",
+                    job->id, job->command);
+        } else {
+            job->used = 0;
+        }
+
+        continue;
+    }
+    pid_t cpid = fork();
+
+    if (cpid < 0) {
+        dprintf(STDERR_FILENO,
+                "terminator: process worker fork failed: %s\n",
+                strerror(errno));
+        continue;
+    }
+
+    if (cpid == 0) {
+        (void)setpgid(0, 0);
+
+        if (chdir(msg.cwd) < 0) {
+            dprintf(STDERR_FILENO, "chdir: %s\n", strerror(errno));
+            _exit(126);
+        }
+
+        execl("/bin/sh", "sh", "-c", msg.command, (char *)NULL);
+
+        dprintf(STDERR_FILENO,
+                "terminator: cannot execute shell: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+
+    (void)setpgid(cpid, cpid);
+
+        if (msg.background) {
+        reap_jobs(NULL);
+
+        Job *job = add_job(cpid, msg.command, 1);
+
+        if (job != NULL) {
+            dprintf(STDOUT_FILENO, "[%d] %ld\n",
+                    job->id, (long)cpid);
+        } else {
+            dprintf(STDERR_FILENO,
+                    "terminator: job table is full\n");
+            (void)kill(-cpid, SIGTERM);
+            (void)waitpid(cpid, NULL, 0);
+        }
+
+        /* Background process continues independently. */
+        continue;
+    }
+
+   process_worker_pgid = (sig_atomic_t)cpid;
+
+int st = 0;
+pid_t waited;
+
+do {
+    waited = waitpid(cpid, &st, 0);
+} while (waited < 0 && errno == EINTR);
+
+process_worker_pgid = -1;
+
+int command_status = 1;
+
+if (waited == cpid) {
+    command_status = status_code(st);
+}
+
+dprintf(STDOUT_FILENO, "\x1eTERM_STATUS:%d\n", command_status);
+}
         close(cmdpipe[0]); _exit(0);
     }
     close(cmdpipe[0]); close(outpipe[1]);
@@ -1337,29 +1725,49 @@ static int start_process_worker(TerminalTab *t)
     return 0;
 }
 
-static int dispatch_process_command(TerminalTab *t, const char *cwd, const char *command)
+static int dispatch_process_command(TerminalTab *t, const char *cwd,
+                                    const char *command, int background)
 {
     if (!t || t->process_cmd_fd < 0 || t->process_worker_pid <= 0) {
         if (t) add_line(t, "Process mode: tab worker is unavailable.");
         return -1;
     }
-    ProcessCommand msg; memset(&msg, 0, sizeof(msg)); msg.magic = PROCESS_COMMAND_MAGIC;
+
+    ProcessCommand msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.magic = PROCESS_COMMAND_MAGIC;
+    msg.background = background;
+
     snprintf(msg.cwd, sizeof(msg.cwd), "%s", cwd ? cwd : "/");
     snprintf(msg.command, sizeof(msg.command), "%s", command ? command : "");
+
     if (write_full_fd(t->process_cmd_fd, &msg, sizeof(msg)) < 0) {
-        add_line(t, "Process mode: failed to send command to tab worker."); return -1;
+        add_line(t, "Process mode: failed to send command to tab worker.");
+        return -1;
     }
+
     return 0;
 }
 
 static void start_pipeline(TerminalTab *t, const char *raw,
                            ParsedCommand cmds[MAX_PIPE_COMMANDS], int ncmd, int background) {
     if (process_mode) {
-        (void)cmds; (void)ncmd; (void)background;
-        if (dispatch_process_command(t, t->cwd, raw) == 0) t->last_status = 0;
-        else t->last_status = 1;
-        return;
+    (void)cmds;
+    (void)ncmd;
+
+    if (dispatch_process_command(t, t->cwd, raw, background) == 0) {
+        if (background) {
+            t->last_status = 0;
+        }
+        /* Foreground status will be updated when the worker
+           reports the actual command exit status. */
+    } else {
+        t->last_status = 1;
     }
+
+    return;
+}
     int pipes[MAX_PIPE_COMMANDS - 1][2];
     int output_pipe[2];
     pid_t pids[MAX_PIPE_COMMANDS] = {0};
@@ -1613,17 +2021,53 @@ static void execute_command(TerminalTab *t, const char *raw) {
     ParsedCommand *c = &cmds[0];
     int has_redirect = c->input_path != NULL || c->output_path != NULL;
     if (ncmd == 1 && !has_redirect && !background) {
-        int argc = c->argc; char **argv = c->argv;
-        if (!strcmp(argv[0], "cd")) { builtin_cd(t, argc, argv); return; }
-        if (!strcmp(argv[0], "exit")) { t->exit_requested = 1; t->last_status = argc > 1 ? atoi(argv[1]) : t->last_status; return; }
-        if (!strcmp(argv[0], "history")) { builtin_history(t); return; }
-        if (!strcmp(argv[0], "jobs")) { builtin_jobs(t); return; }
-        if (!strcmp(argv[0], "bg")) { builtin_bg(t, argc, argv); return; }
-        if (!strcmp(argv[0], "fg")) { builtin_fg(t, argc, argv); return; }
-        if (!strcmp(argv[0], "source") || !strcmp(argv[0], ".")) { builtin_source(t, argc, argv); return; }
-        if (!strcmp(argv[0], "true")) { t->last_status = 0; return; }
-        if (!strcmp(argv[0], "false")) { t->last_status = 1; return; }
+    int argc = c->argc;
+    char **argv = c->argv;
+
+    if (!strcmp(argv[0], "cd")) {
+        builtin_cd(t, argc, argv);
+        return;
     }
+    if (!strcmp(argv[0], "exit")) {
+        t->exit_requested = 1;
+        t->last_status = argc > 1 ? atoi(argv[1]) : t->last_status;
+        return;
+    }
+    if (!strcmp(argv[0], "history")) {
+        builtin_history(t);
+        return;
+    }
+
+    /* Thread mode handles job-control built-ins in the parent.
+       Process mode must send them to its worker. */
+    if (!process_mode) {
+        if (!strcmp(argv[0], "jobs")) {
+            builtin_jobs(t);
+            return;
+        }
+        if (!strcmp(argv[0], "bg")) {
+            builtin_bg(t, argc, argv);
+            return;
+        }
+        if (!strcmp(argv[0], "fg")) {
+            builtin_fg(t, argc, argv);
+            return;
+        }
+    }
+
+    if (!strcmp(argv[0], "source") || !strcmp(argv[0], ".")) {
+        builtin_source(t, argc, argv);
+        return;
+    }
+    if (!strcmp(argv[0], "true")) {
+        t->last_status = 0;
+        return;
+    }
+    if (!strcmp(argv[0], "false")) {
+        t->last_status = 1;
+        return;
+    }
+}
     if (t->child_running && !background) { add_line(t, "A foreground command is already running in this tab."); t->last_status = 1; return; }
     start_pipeline(t, command, cmds, ncmd, background);
 }
@@ -2338,7 +2782,24 @@ int main(int argc, char **argv) {
         for (int i = 0; i < watch_state.count; i++) if (watch_state.active && watch_state.fds[i] >= 0) { fds[nfds].fd = watch_state.fds[i]; fds[nfds].events = POLLIN | POLLHUP; fds[nfds].revents = 0; tabidx[nfds] = -1; watchidx[nfds++] = i; }
         int timeout = watch_state.active ? 200 : -1; if (watch_state.active) { time_t now = time(NULL); int ms = (int)(watch_state.next_start - now) * 1000; if (ms < 0) ms = 0; if (ms < timeout) timeout = ms; }
         int r = poll(fds, nfds, timeout); if (r < 0 && errno != EINTR) { perror("poll"); break; }
-        if (fds[0].revents & POLLIN) while (XPending(display) > 0) { XEvent ev; XNextEvent(display, &ev); switch (ev.type) { case Expose: if (!ev.xexpose.count) draw_screen(); break; case MapNotify: draw_screen(); break; case KeyPress: handle_keypress(&ev.xkey); break; case ButtonPress: handle_mouse_click(&ev.xbutton); break; case ButtonRelease: handle_mouse_release(&ev.xbutton); break; case MotionNotify: handle_mouse_motion(&ev.xmotion); break; case SelectionRequest: handle_selection_request(&ev.xselectionrequest); break; case SelectionNotify: handle_selection_notify(&ev.xselection); break; case ClientMessage: if ((Atom)ev.xclient.data.l[0] == wm_delete) running = 0; break; default: break; } }
+        if (fds[0].revents & POLLIN) while (XPending(display) > 0) { XEvent ev; XNextEvent(display, &ev); switch (ev.type) { case Expose:
+    if (!ev.xexpose.count)
+        draw_screen();
+    break;
+
+case MapNotify:
+    draw_screen();
+    break;
+
+case ConfigureNotify:
+    current_win_width = ev.xconfigure.width;
+    current_win_height = ev.xconfigure.height;
+    draw_screen();
+    break;
+
+case KeyPress:
+    handle_keypress(&ev.xkey);
+     break; case ButtonPress: handle_mouse_click(&ev.xbutton); break; case ButtonRelease: handle_mouse_release(&ev.xbutton); break; case MotionNotify: handle_mouse_motion(&ev.xmotion); break; case SelectionRequest: handle_selection_request(&ev.xselectionrequest); break; case SelectionNotify: handle_selection_notify(&ev.xselection); break; case ClientMessage: if ((Atom)ev.xclient.data.l[0] == wm_delete) running = 0; break; default: break; } }
         for (int i = 1; i < nfds; i++) if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) { if (tabidx[i] >= 0 && tabidx[i] < tab_count) handle_pipe_output(&tabs[tabidx[i]]); else if (watchidx[i] >= 0 &&
          watch_state.active &&
          watch_state.owner_tab >= 0 &&
@@ -2351,11 +2812,18 @@ int main(int argc, char **argv) {
     watch_state.owner_tab < tab_count &&
     tabs[watch_state.owner_tab].used) {
     service_watch(&tabs[watch_state.owner_tab]);
-} for (int i = 0; i < tab_count; i++) if (tabs[i].exit_requested) { if (tab_count > 1) { active_tab = i; close_current_tab(); } else running = 0; break; } draw_screen();
+} for (int i = 0; i < tab_count; i++) if (tabs[i].exit_requested) { if (tab_count > 1) { active_tab = i; close_current_tab(); } else running = 0; break; } 
     }
     if (!process_mode) stop_tab_workers();
     if (watch_state.active) stop_watch(current_tab());
     for (int i = 0; i < tab_count; i++) { if (tabs[i].process_cmd_fd >= 0) close(tabs[i].process_cmd_fd); if (tabs[i].process_worker_pid > 0) { kill(tabs[i].process_worker_pid, SIGTERM); (void)waitpid(tabs[i].process_worker_pid, NULL, 0); } if (tabs[i].output_fd >= 0) close(tabs[i].output_fd); if (tabs[i].child_running && tabs[i].child_pgid > 0) { kill(-tabs[i].child_pgid, SIGTERM); waitpid(tabs[i].child_pid, NULL, 0); } }
     for (int i = 0; i < MAX_JOBS; i++) if (jobs[i].used && jobs[i].pgid > 0) kill(-jobs[i].pgid, SIGTERM);
-    XFreeGC(display, gc); XDestroyWindow(display, window); XCloseDisplay(display); shared_state_close(); return 0;
+    if (back_buffer) {
+    XFreePixmap(display, back_buffer);
+    back_buffer = 0;
+}
+
+XFreeGC(display, gc);
+XDestroyWindow(display, window);
+XCloseDisplay(display); shared_state_close(); return 0;
 }
